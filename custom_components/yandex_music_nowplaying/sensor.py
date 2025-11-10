@@ -676,6 +676,10 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         # Last.fm
         self._scrobbler = scrobbler
 
+        # --- ДЛЯ ОТКАТА ПРИ НЕИГРАЮЩЕЙ КОЛОНКЕ ---
+        self._last_data: Optional[dict] = None
+        self._last_data_source: Optional[str] = None
+
     @property
     def should_poll(self) -> bool:
         # Если есть push (ynison) — сенсор сам обновляется по push,
@@ -779,6 +783,14 @@ class YandexMusicNowPlayingSensor(SensorEntity):
             "source": source,
             "liked": liked,
         }
+
+        # запомним последнюю валидную информацию сенсора для возможного отката
+        if source in ("queues", "ynison"):
+            try:
+                self._last_data = dict(data)
+            except Exception:
+                self._last_data = data
+            self._last_data_source = source
 
         # шарим текущий трек для switch
         shared = self.hass.data.setdefault(DOMAIN, {})
@@ -893,6 +905,15 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         if new_state is None:
             return
         attrs = new_state.attributes or {}
+        state = new_state.state  # 'playing', 'paused', 'idle', ...
+
+        # ---- Новая логика: если колонка НЕ играет — не затираем сенсор, а откатываемся к последнему валидному источнику ----
+        if state != "playing":
+            _LOGGER.debug("Station '%s' not playing (state=%s) — keep previous sensor data", entity_id, state)
+            if self._last_data is not None:
+                # мгновенно восстановим актуальные данные от Ynison/queues
+                self._apply_update(dict(self._last_data), source=(self._last_data_source or "queues"), push=True)
+            return
 
         # Извлекаем базовые поля
         title = (
@@ -923,7 +944,6 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         )
         progress = attrs.get("media_position") or (attrs.get("player_state") or {}).get("position_ms")
         duration = attrs.get("media_duration") or (attrs.get("player_state") or {}).get("duration_ms")
-        state = new_state.state  # 'playing', 'paused', ...
 
         # Пытаемся вытащить track_id из media_content_id
         content_id = (
