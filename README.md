@@ -36,3 +36,5 @@ switch:
 Создаем приложение https://www.last.fm/api/account/create полученные данные нужны для сенсора и для получения session_key
 
 session_key можно получить по ссылке https://dullmace.github.io/lastfm-sessionkey/
+
+Токен для яндекса можно получить при помощи https://chromewebstore.google.com/detail/yandex-music-token/lcbjeookjibfhjjopieifgjnhlegmkib
