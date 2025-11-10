@@ -1,0 +1,12 @@
+like_current:
+  name: Like current track
+  description: "Поставить лайк треку, который сейчас играет (по данным сенсора)."
+
+unlike_current:
+  name: Unlike current track
+  description: "Снять лайк у текущего трека."
+
+toggle_like:
+  name: Toggle like
+  description: "Переключить лайк текущего трека."
+

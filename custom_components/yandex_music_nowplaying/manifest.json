@@ -1,0 +1,10 @@
+{
+  "domain": "yandex_music_nowplaying",
+  "name": "Yandex Music Now Playing",
+  "documentation": "https://github.com/Druidblack/yandex_music_nowplaying",
+  "issue_tracker": "https://github.com/Druidblack/yandex_music_nowplaying/issues",
+  "codeowners": ["@druidblack"],
+  "version": "0.1.0",
+  "iot_class": "cloud_polling",
+  "requirements": ["yandex-music>=2.2.0"]
+}
