@@ -130,6 +130,19 @@ class LastFmScrobbler:
         self._last_nowplaying_key: Optional[str] = None
         self._last_scrobbled_key: Optional[str] = None
         self._scrobble_task: Optional[asyncio.Task] = None
+        
+    @staticmethod
+    def _normalize_artist_string(s: str) -> str:
+        if not s:
+            return s
+        # если уже есть & или feat — оставим как есть
+        low = s.lower()
+        if " & " in s or " feat" in low or " ft." in low or " featuring " in low:
+            return s
+        # иначе разобьём по распространённым разделителям и склеим через ' & '
+        parts = re.split(r"\s*,\s*|\s*;\s*|\s*/\s*", s)
+        parts = [p for p in parts if p]
+        return " & ".join(parts) if len(parts) > 1 else s
 
     @staticmethod
     def _build_track_key(artist: str, title: str, album: Optional[str], duration_sec: Optional[float]) -> str:
@@ -228,6 +241,8 @@ class LastFmScrobbler:
         title_s = (title or "").strip()
         album_s = (album or "").strip() if album else None
         duration_sec = self._as_int_seconds((duration_ms or 0) / 1000.0 if duration_ms else None)
+        
+        artist_s = self._normalize_artist_string(artist_s)
 
         if not artist_s and not title_s:
             return
