@@ -149,13 +149,17 @@ class LastFmScrobbler:
             return None
 
     @staticmethod
-    def _first_artist(s: str) -> str:
-        """Берём только первого исполнителя для Last.fm."""
+    def _normalize_artist_string(s: str) -> str:
         if not s:
             return s
-        # режем по запятым / ; / feat / ft / featuring
-        parts = re.split(r"\s*(?:,|;|feat\.?|ft\.?|featuring)\s*", s, flags=re.IGNORECASE)
-        return parts[0].strip() if parts else s
+        # если уже есть & или feat — оставим как есть
+        low = s.lower()
+        if " & " in s or " feat" in low or " ft." in low or " featuring " in low:
+            return s
+        # иначе разобьём по распространённым разделителям и склеим через ' & '
+        parts = re.split(r"\s*,\s*|\s*;\s*|\s*/\s*", s)
+        parts = [p for p in parts if p]
+        return " & ".join(parts) if len(parts) > 1 else s
 
     def _sign(self, params: dict) -> str:
         # Сигнатура: конкат всех key+value в алф. порядке ключей + secret, md5 hex
@@ -238,8 +242,8 @@ class LastFmScrobbler:
         album_s = (album or "").strip() if album else None
         duration_sec = self._as_int_seconds((duration_ms or 0) / 1000.0 if duration_ms else None)
 
-        # берём только первого исполнителя для Last.fm
-        artist_s = self._first_artist(artist_s)
+
+        artist_s = self._normalize_artist_string(artist_s)
 
         if not artist_s and not title_s:
             return
