@@ -22,7 +22,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, ServiceCall, State, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_state_change
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.typing import DiscoveryInfoType
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -55,8 +55,8 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_SCAN_INTERVAL, default=timedelta(seconds=15)): cv.time_period,
         vol.Optional("update_interval"): vol.All(int, vol.Range(min=5, max=3600)),
         vol.Optional("ynison", default=True): cv.boolean,  # push с Я.Музыки (браузер/телефон)
-        vol.Optional("ynison_mode", default="put"): vol.In(["auto", "get", "put"]),  # совместимость; фактически 'put'
-        # Список колонок AlexxIT/YandexStation, из которых читать now playing
+        vol.Optional("ynison_mode", default="put"): vol.In(["auto", "get", "put"]),  # для совместимости; фактически 'put'
+        # Список колонок AlexxIT/YandexStation, из которых читаем now playing
         vol.Optional("station_entities"): vol.Any(cv.string, [cv.string]),
         # Опционально: Last.fm
         vol.Optional("lastfm"): LASTFM_SCHEMA,
@@ -130,19 +130,6 @@ class LastFmScrobbler:
         self._last_nowplaying_key: Optional[str] = None
         self._last_scrobbled_key: Optional[str] = None
         self._scrobble_task: Optional[asyncio.Task] = None
-        
-    @staticmethod
-    def _normalize_artist_string(s: str) -> str:
-        if not s:
-            return s
-        # если уже есть & или feat — оставим как есть
-        low = s.lower()
-        if " & " in s or " feat" in low or " ft." in low or " featuring " in low:
-            return s
-        # иначе разобьём по распространённым разделителям и склеим через ' & '
-        parts = re.split(r"\s*,\s*|\s*;\s*|\s*/\s*", s)
-        parts = [p for p in parts if p]
-        return " & ".join(parts) if len(parts) > 1 else s
 
     @staticmethod
     def _build_track_key(artist: str, title: str, album: Optional[str], duration_sec: Optional[float]) -> str:
@@ -160,6 +147,15 @@ class LastFmScrobbler:
             return int(round(float(x)))
         except Exception:
             return None
+
+    @staticmethod
+    def _first_artist(s: str) -> str:
+        """Берём только первого исполнителя для Last.fm."""
+        if not s:
+            return s
+        # режем по запятым / ; / feat / ft / featuring
+        parts = re.split(r"\s*(?:,|;|feat\.?|ft\.?|featuring)\s*", s, flags=re.IGNORECASE)
+        return parts[0].strip() if parts else s
 
     def _sign(self, params: dict) -> str:
         # Сигнатура: конкат всех key+value в алф. порядке ключей + secret, md5 hex
@@ -241,8 +237,9 @@ class LastFmScrobbler:
         title_s = (title or "").strip()
         album_s = (album or "").strip() if album else None
         duration_sec = self._as_int_seconds((duration_ms or 0) / 1000.0 if duration_ms else None)
-        
-        artist_s = self._normalize_artist_string(artist_s)
+
+        # берём только первого исполнителя для Last.fm
+        artist_s = self._first_artist(artist_s)
 
         if not artist_s and not title_s:
             return
@@ -451,6 +448,7 @@ class YnisonWatcher:
                         while True:
                             await asyncio.sleep(25)
                             await ws.ping()
+                        # noqa
                     except Exception:
                         pass
 
@@ -691,14 +689,13 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         # Last.fm
         self._scrobbler = scrobbler
 
-        # --- ДЛЯ ОТКАТА ПРИ НЕИГРАЮЩЕЙ КОЛОНКЕ ---
+        # для отката, если колонка не играет
         self._last_data: Optional[dict] = None
         self._last_data_source: Optional[str] = None
 
     @property
     def should_poll(self) -> bool:
-        # Если есть push (ynison) — сенсор сам обновляется по push,
-        # но мы всё равно слушаем media_player через подписку (это не poll).
+        # Если есть push (ynison) — сенсор сам обновляется по push.
         return not self._enable_ynison
 
     @property
@@ -735,10 +732,12 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         # первичная загрузка лайков (асинхронно, без блокировок)
         self.hass.async_create_task(self._async_refresh_likes_cache())
 
-        # подписка на изменения медиаплееров AlexxIT
+        # подписка на изменения медиаплееров AlexxIT через новый API
         if self._station_entities:
-            self._unsub_station = async_track_state_change(
-                self.hass, self._station_entities, self._on_station_state
+            self._unsub_station = async_track_state_change_event(
+                self.hass,
+                self._station_entities,
+                self._on_station_state_event,
             )
             _LOGGER.info("Listening media_player(s): %s", ", ".join(self._station_entities))
 
@@ -916,17 +915,25 @@ class YandexMusicNowPlayingSensor(SensorEntity):
 
     # ----------------- Подписка на media_player.* (YandexStation) -----------------
     @callback
+    def _on_station_state_event(self, event) -> None:
+        """Обёртка под async_track_state_change_event."""
+        data = event.data
+        entity_id = data.get("entity_id")
+        old_state = data.get("old_state")
+        new_state = data.get("new_state")
+        self._on_station_state(entity_id, old_state, new_state)
+
+    @callback
     def _on_station_state(self, entity_id: str, old_state: Optional[State], new_state: Optional[State]) -> None:
         if new_state is None:
             return
         attrs = new_state.attributes or {}
         state = new_state.state  # 'playing', 'paused', 'idle', ...
 
-        # ---- Новая логика: если колонка НЕ играет — не затираем сенсор, а откатываемся к последнему валидному источнику ----
+        # если колонка не играет — не затираем сенсор, а возвращаем последнюю валидную инфу
         if state != "playing":
             _LOGGER.debug("Station '%s' not playing (state=%s) — keep previous sensor data", entity_id, state)
             if self._last_data is not None:
-                # мгновенно восстановим актуальные данные от Ynison/queues
                 self._apply_update(dict(self._last_data), source=(self._last_data_source or "queues"), push=True)
             return
 
