@@ -485,6 +485,7 @@ class YnisonWatcher:
     async def _handle_state(self, data: dict) -> None:
         ps = data.get("player_state") or {}
         q = ps.get("player_queue") or {}
+        status = ps.get("status") or {}
         idx = q.get("current_playable_index", -1)
         lst = q.get("playable_list") or []
         playable_id = None
@@ -530,6 +531,8 @@ class YnisonWatcher:
             "track_id": getattr(track, "id", None),
             "cover": cover,
             "duration_ms": getattr(track, "duration_ms", None),
+            "progress_ms": status.get("progress_ms"),
+            "paused": status.get("paused"),
             "explicit": getattr(track, "explicit", None),
             "context_type": q.get("entity_type"),
             "queue_id": q.get("entity_id"),
@@ -647,7 +650,7 @@ async def async_setup_platform(
         station_entities=station_entities,
         scrobbler=scrobbler,
     )
-    async_add_entities([entity], False)
+    async_add_entities([entity], True)
 
     # сервисы лайка
     async def async_like_current(call: ServiceCall): await entity.async_like_current()
@@ -684,6 +687,7 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         self._enable_ynison = enable_ynison
         self._ynison: Optional[YnisonWatcher] = None
         self._last_push: Optional[dict] = None
+        self._last_push_ts: float = 0.0
 
         # Слушаем эти media_player.* (AlexxIT)
         self._station_entities = list(dict.fromkeys(station_entities))  # уникальные, порядок сохранён
@@ -696,11 +700,15 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         # для отката, если колонка не играет
         self._last_data: Optional[dict] = None
         self._last_data_source: Optional[str] = None
+        self._last_data_ts: float = 0.0
 
     @property
     def should_poll(self) -> bool:
-        # Если есть push (ynison) — сенсор сам обновляется по push.
-        return not self._enable_ynison
+        # Даже при push оставляем периодический poll как страховку:
+        # 1) начальная инициализация после старта HA;
+        # 2) восстановление после потери websocket/push-события;
+        # 3) добор данных, если Яндекс отдал неполный push.
+        return True
 
     @property
     def extra_state_attributes(self):
@@ -759,22 +767,103 @@ class YandexMusicNowPlayingSensor(SensorEntity):
     # ----------------- PUSH из Ynison -----------------
     @callback
     def _handle_push_update(self, data: Optional[dict]) -> None:
-        self._apply_update(data, source="ynison", push=True)
+        self._last_push_ts = time.monotonic()
+        self._apply_update(data, source="ynison", push=True, clear_cache=(data is None))
 
     # ----------------- PULL-фолбэк (очереди) -----------------
     async def async_update(self) -> None:
-        if self._enable_ynison and self._last_push is not None:
+        # 1) Если один из media_player уже играет, берём его состояние немедленно.
+        for entity_id in self._station_entities:
+            st = self.hass.states.get(entity_id)
+            if st is not None and st.state == "playing":
+                self._on_station_state(entity_id, None, st)
+                return
+
+        # 2) Свежий push от Ynison считаем приоритетным источником.
+        push_ttl = max(30.0, self._scan_interval.total_seconds() * 3.0)
+        if self._enable_ynison and self._last_push is not None and (time.monotonic() - self._last_push_ts) <= push_ttl:
             return
+
+        # 3) Если push нет/он устарел — используем pull как резерв.
         data = await self.hass.async_add_executor_job(self._fetch_now_playing_pull)
-        self._apply_update(data, source="queues", push=False)
+        if data is not None:
+            self._apply_update(data, source="queues", push=False)
+            return
+
+        # 4) Если pull ничего не дал, но у нас ещё есть свежий push — не затираем его пустым состоянием.
+        if self._enable_ynison and self._last_push is not None and (time.monotonic() - self._last_push_ts) <= (push_ttl * 2.0):
+            self._apply_update(self._last_push, source="ynison", push=False)
+            return
+
+        # 5) Если источники временно молчат/врут, но у нас есть последнее валидное состояние,
+        # сохраняем его до предполагаемого окончания трека (+ запас), а не уходим в unknown.
+        if self._should_preserve_last_data() and self._last_data is not None:
+            try:
+                last_data = dict(self._last_data)
+            except Exception:
+                last_data = self._last_data
+            self._apply_update(last_data, source=(self._last_data_source or "fallback"), push=False)
+            return
+
+        self._apply_update(None, source="queues", push=False)
+
+    def _get_preserve_timeout(self, data: Optional[dict]) -> float:
+        """Сколько можно держать последнее корректное состояние без новых апдейтов."""
+        if not data:
+            return 0.0
+
+        base_grace = max(120.0, self._scan_interval.total_seconds() * 6.0)
+
+        try:
+            paused = bool(data.get("paused"))
+        except Exception:
+            paused = False
+        if paused:
+            return max(600.0, base_grace)
+
+        duration_ms = data.get("duration_ms")
+        progress_ms = data.get("progress_ms")
+        if progress_ms is None:
+            pos = data.get("media_position")
+            if pos is not None:
+                try:
+                    p = float(pos)
+                    progress_ms = p * 1000.0 if p < 10000 else p
+                except Exception:
+                    progress_ms = None
+
+        try:
+            duration_ms_f = float(duration_ms) if duration_ms is not None else 0.0
+        except Exception:
+            duration_ms_f = 0.0
+        try:
+            progress_ms_f = float(progress_ms) if progress_ms is not None else 0.0
+        except Exception:
+            progress_ms_f = 0.0
+
+        if duration_ms_f > 0:
+            remaining_sec = max(0.0, (duration_ms_f - max(0.0, progress_ms_f)) / 1000.0)
+            return max(base_grace, remaining_sec + base_grace)
+
+        return max(600.0, base_grace)
+
+    def _should_preserve_last_data(self) -> bool:
+        if not self._last_data or self._last_data_ts <= 0:
+            return False
+        age = time.monotonic() - self._last_data_ts
+        return age <= self._get_preserve_timeout(self._last_data)
 
     # ----------------- Применение обновления -----------------
-    def _apply_update(self, data: Optional[dict], source: str, *, push: bool) -> None:
+    def _apply_update(self, data: Optional[dict], source: str, *, push: bool, clear_cache: bool = False) -> None:
         self._last_push = data if source == "ynison" else self._last_push
         if not data:
             self._attr_native_value = None
             self._attrs = {}
             self._last_track_id = None
+            if clear_cache:
+                self._last_data = None
+                self._last_data_source = None
+                self._last_data_ts = 0.0
             shared = self.hass.data.setdefault(DOMAIN, {})
             shared["current_track_id"] = None
             if push or self.entity_id is not None:
@@ -803,12 +892,13 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         }
 
         # запомним последнюю валидную информацию сенсора для возможного отката
-        if source in ("queues", "ynison"):
+        if source in ("queues", "ynison", "media_player"):
             try:
                 self._last_data = dict(data)
             except Exception:
                 self._last_data = data
             self._last_data_source = source
+            self._last_data_ts = time.monotonic()
 
         # шарим текущий трек для switch
         shared = self.hass.data.setdefault(DOMAIN, {})
@@ -835,14 +925,12 @@ class YandexMusicNowPlayingSensor(SensorEntity):
                 _LOGGER.debug("queues_list(): empty")
                 return None
 
-            try:
-                queues_sorted = sorted(
-                    queues, key=lambda q: getattr(q, "modified", ""), reverse=True
-                )
-            except Exception:
-                queues_sorted = queues
+            # По документации yandex-music последняя проигрываемая очередь
+            # уже приходит первой в списке, поэтому не пересортировываем очереди
+            # только по modified — это может привести к выбору устаревшего плейлиста.
+            queues_ordered = list(queues)
 
-            for qi in queues_sorted:
+            for qi in queues_ordered:
                 qid = getattr(qi, "id", None) or getattr(qi, "queue_id", None)
                 q = None
                 if hasattr(qi, "fetch_queue"):
@@ -1020,6 +1108,36 @@ class YandexMusicNowPlayingSensor(SensorEntity):
             if key and key != self._last_resolve_key and (artist or title):
                 self._last_resolve_key = key
                 self.hass.async_create_task(self._async_resolve_station_track(title, artist, album, cover))
+
+        try:
+            p = float(progress) if progress is not None else None
+            progress_ms_norm = (p * 1000.0) if (p is not None and p < 10000) else p
+        except Exception:
+            progress_ms_norm = None
+        try:
+            d = float(duration) if duration is not None else None
+            duration_ms_norm = (d * 1000.0) if (d is not None and d < 10000) else d
+        except Exception:
+            duration_ms_norm = None
+
+        # кэшируем последнее валидное состояние media_player как fallback
+        if title or artist:
+            self._last_data = {
+                "title": title or None,
+                "artists": artist or None,
+                "album": album,
+                "track_id": track_id,
+                "cover": cover,
+                "duration_ms": duration_ms_norm,
+                "progress_ms": progress_ms_norm,
+                "explicit": self._attrs.get("explicit"),
+                "context_type": self._attrs.get("context_type"),
+                "queue_id": self._attrs.get("queue_id"),
+                "paused": state == "paused",
+                "media_position": progress,
+            }
+            self._last_data_source = "media_player"
+            self._last_data_ts = time.monotonic()
 
         if self.entity_id is not None:
             self.async_write_ha_state()
