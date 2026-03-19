@@ -47,9 +47,12 @@ session_key можно получить по ссылке https://dullmace.githu
 Для этого на устройстве (магнитола, планшет) должены быть установленны  приложения home assistant ну и яндекс навигатор
 В приложение home assistant нужно  включить "Сенсоры уведомлений"
 ![111](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/photo_2026-03-19_13-05-57.jpg)
+
 Включить нужно "Последнее уведомление" и "Сеанс мультимедиа"
 ![21314](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/photo_2026-03-19_13-06-24.jpg)
+
 ![fdt](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/photo_2026-03-19_13-07-36.jpg)
+
 В "Сенсоре уведомлений" нужно выбрать в списке разрешенных Яндекс навигатор
 
 И в configuration.yaml прописать сенсоры из которых мы будем получать данные. В примере выше они написанны. m2007j20cg - название вашего устройства
