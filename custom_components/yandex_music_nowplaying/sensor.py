@@ -30,6 +30,95 @@ import hashlib
 
 _LOGGER = logging.getLogger(__name__)  # custom_components.yandex_music_nowplaying.sensor
 
+
+def _dbg_trim(value: Any, limit: int = 160) -> str:
+    try:
+        s = str(value)
+    except Exception:
+        s = repr(value)
+    return s if len(s) <= limit else s[: limit - 3] + "..."
+
+
+def _dbg_track_summary(data: Optional[dict]) -> str:
+    if not data:
+        return "empty"
+    return (
+        f"track_id={_dbg_trim(data.get('track_id'))}, "
+        f"title={_dbg_trim(data.get('title'))}, "
+        f"artists={_dbg_trim(data.get('artists'))}, "
+        f"queue_id={_dbg_trim(data.get('queue_id'))}, "
+        f"context_type={_dbg_trim(data.get('context_type'))}, "
+        f"paused={_dbg_trim(data.get('paused'))}, "
+        f"progress_ms={_dbg_trim(data.get('progress_ms'))}"
+    )
+
+
+
+def _canon_attr_key(key: Any) -> str:
+    try:
+        s = str(key)
+    except Exception:
+        return ""
+    return "".join(ch.lower() for ch in s if ch.isalnum())
+
+
+def _build_attr_index(attrs: dict) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in (attrs or {}).items():
+        ck = _canon_attr_key(k)
+        if ck and ck not in out:
+            out[ck] = v
+    return out
+
+
+def _flex_attr_get(attrs: dict, *candidates: str) -> Any:
+    if not attrs:
+        return None
+    index = _build_attr_index(attrs)
+    for cand in candidates:
+        ck = _canon_attr_key(cand)
+        if ck and ck in index:
+            return index[ck]
+    return None
+
+
+def _flex_attr_find_for_package(attrs: dict, label: str, package: str) -> Any:
+    if not attrs:
+        return None
+    label_ck = _canon_attr_key(label)
+    pkg_ck = _canon_attr_key(package)
+    if not label_ck or not pkg_ck:
+        return None
+    index = _build_attr_index(attrs)
+
+    direct_candidates = [
+        f"{label} {package}",
+        f"{label}_{package}",
+        f"{label}.{package}",
+        f"{package} {label}",
+        f"{package}_{label}",
+        f"{package}.{label}",
+    ]
+    for cand in direct_candidates:
+        ck = _canon_attr_key(cand)
+        if ck in index:
+            return index[ck]
+
+    for ck, value in index.items():
+        if label_ck in ck and pkg_ck in ck:
+            return value
+    return None
+
+
+def _normalize_entity_list(cfg: Any) -> list[str]:
+    entities: list[str] = []
+    if isinstance(cfg, str):
+        entities = [e.strip() for e in cfg.split(",") if e.strip()]
+    elif isinstance(cfg, (list, tuple)):
+        entities = [str(e).strip() for e in cfg if str(e).strip()]
+    return list(dict.fromkeys(entities))
+
+
 DEFAULT_NAME = "Yandex Music Now Playing"
 DOMAIN = "yandex_music_nowplaying"
 
@@ -58,6 +147,10 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional("ynison_mode", default="put"): vol.In(["auto", "get", "put"]),  # для совместимости; фактически 'put'
         # Список колонок AlexxIT/YandexStation, из которых читаем now playing
         vol.Optional("station_entities"): vol.Any(cv.string, [cv.string]),
+        # Android Companion fallback: media_session / last_notification
+        vol.Optional("android_media_session_entities"): vol.Any(cv.string, [cv.string]),
+        vol.Optional("android_notification_entities"): vol.Any(cv.string, [cv.string]),
+        vol.Optional("android_packages", default=["ru.yandex.yandexnavi", "ru.yandex.yandexmaps", "ru.yandex.music"]): vol.Any(cv.string, [cv.string]),
         # Опционально: Last.fm
         vol.Optional("lastfm"): LASTFM_SCHEMA,
     }
@@ -310,6 +403,7 @@ class YnisonWatcher:
         self._on_update = on_update
         self._task: Optional[asyncio.Task] = None
         self._stopped = asyncio.Event()
+        self._ws = None
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -319,11 +413,24 @@ class YnisonWatcher:
 
     async def stop(self) -> None:
         self._stopped.set()
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
         if self._task:
             try:
                 await asyncio.wait_for(self._task, timeout=3)
             except asyncio.TimeoutError:
-                pass
+                try:
+                    self._task.cancel()
+                except Exception:
+                    pass
+            except asyncio.CancelledError:
+                raise
+            finally:
+                self._task = None
 
     async def _runner(self) -> None:
         backoff = 2
@@ -393,6 +500,7 @@ class YnisonWatcher:
 
             url = f"wss://{host}/ynison_state.YnisonStateService/PutYnisonState"
             async with session.ws_connect(url=url, headers=headers, timeout=10) as ws:
+                self._ws = ws
                 _LOGGER.debug("Ynison connected (Put): host=%s device_id=%s", host, device_id)
 
                 bootstrap = {
@@ -480,6 +588,7 @@ class YnisonWatcher:
                             continue
                 finally:
                     ping_task.cancel()
+                    self._ws = None
             return True
 
     async def _handle_state(self, data: dict) -> None:
@@ -495,6 +604,17 @@ class YnisonWatcher:
             playable_id = playable.get("playable_id") or playable.get("id")
 
         track_id = self._normalize_track_id(playable_id)
+        _LOGGER.debug(
+            "Ynison raw state: idx=%s list_len=%s entity_type=%s entity_id=%s paused=%s progress_ms=%s playable_id=%s resolved_track_id=%s",
+            idx,
+            len(lst),
+            q.get("entity_type"),
+            q.get("entity_id"),
+            status.get("paused"),
+            status.get("progress_ms"),
+            _dbg_trim(playable_id),
+            track_id,
+        )
         if not track_id:
             self._on_update(None)
             return
@@ -537,6 +657,7 @@ class YnisonWatcher:
             "context_type": q.get("entity_type"),
             "queue_id": q.get("entity_id"),
         }
+        _LOGGER.debug("Ynison resolved state: %s", _dbg_track_summary(update))
         self._on_update(update)
 
     @staticmethod
@@ -576,12 +697,10 @@ async def async_setup_platform(
         _LOGGER.warning("ynison_mode=%s игнорируется; используем 'put'", ynison_mode)
 
     # список media_player.* от AlexxIT (строкой через запятую или списком)
-    station_entities_cfg = config.get("station_entities")
-    station_entities: list[str] = []
-    if isinstance(station_entities_cfg, str):
-        station_entities = [e.strip() for e in station_entities_cfg.split(",") if e.strip()]
-    elif isinstance(station_entities_cfg, (list, tuple)):
-        station_entities = [str(e).strip() for e in station_entities_cfg if str(e).strip()]
+    station_entities = _normalize_entity_list(config.get("station_entities"))
+    android_media_session_entities = _normalize_entity_list(config.get("android_media_session_entities"))
+    android_notification_entities = _normalize_entity_list(config.get("android_notification_entities"))
+    android_packages = _normalize_entity_list(config.get("android_packages"))
 
     # --- опциональный Last.fm ---
     lastfm_cfg = config.get("lastfm")
@@ -648,6 +767,9 @@ async def async_setup_platform(
         poll_interval=interval_td,
         enable_ynison=use_ynison,
         station_entities=station_entities,
+        android_media_session_entities=android_media_session_entities,
+        android_notification_entities=android_notification_entities,
+        android_packages=android_packages,
         scrobbler=scrobbler,
     )
     async_add_entities([entity], True)
@@ -674,6 +796,9 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         poll_interval: timedelta,
         enable_ynison: bool,
         station_entities: list[str],
+        android_media_session_entities: list[str],
+        android_notification_entities: list[str],
+        android_packages: list[str],
         scrobbler: Optional[LastFmScrobbler],
     ):
         self.hass = hass
@@ -691,8 +816,14 @@ class YandexMusicNowPlayingSensor(SensorEntity):
 
         # Слушаем эти media_player.* (AlexxIT)
         self._station_entities = list(dict.fromkeys(station_entities))  # уникальные, порядок сохранён
+        self._android_media_session_entities = list(dict.fromkeys(android_media_session_entities))
+        self._android_notification_entities = list(dict.fromkeys(android_notification_entities))
+        self._android_packages = list(dict.fromkeys(android_packages)) or ["ru.yandex.yandexnavi", "ru.yandex.yandexmaps", "ru.yandex.music"]
         self._unsub_station = None
+        self._unsub_android = None
         self._last_resolve_key: Optional[str] = None  # чтобы не спамить поиск
+        self._last_android_data: Optional[dict] = None
+        self._last_android_ts: float = 0.0
 
         # Last.fm
         self._scrobbler = scrobbler
@@ -701,6 +832,144 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         self._last_data: Optional[dict] = None
         self._last_data_source: Optional[str] = None
         self._last_data_ts: float = 0.0
+
+        # watchdog для stale-state Ynison
+        self._ynison_expected_end_ts: float = 0.0
+        self._ynison_last_progress_ts: float = 0.0
+        self._ynison_last_progress_ms: Optional[float] = None
+        self._ynison_last_track_id: Optional[str] = None
+        self._ynison_stale_hits: int = 0
+        self._ynison_reconnect_lock = asyncio.Lock()
+        self._ynison_reconnect_task: Optional[asyncio.Task] = None
+        self._ynison_last_reconnect_ts: float = 0.0
+
+    def _update_ynison_watchdog(self, data: Optional[dict]) -> None:
+        now = time.monotonic()
+        if not data:
+            self._ynison_expected_end_ts = 0.0
+            self._ynison_last_progress_ts = now
+            self._ynison_last_progress_ms = None
+            self._ynison_last_track_id = None
+            self._ynison_stale_hits = 0
+            return
+
+        track_id = str(data.get("track_id")) if data.get("track_id") is not None else None
+        paused = bool(data.get("paused"))
+
+        progress_ms = data.get("progress_ms")
+        try:
+            progress_ms_f = float(progress_ms) if progress_ms is not None else None
+        except Exception:
+            progress_ms_f = None
+
+        duration_ms = data.get("duration_ms")
+        try:
+            duration_ms_f = float(duration_ms) if duration_ms is not None else None
+        except Exception:
+            duration_ms_f = None
+
+        prev_track_id = self._ynison_last_track_id
+        prev_progress_ms = self._ynison_last_progress_ms
+        prev_progress_ts = self._ynison_last_progress_ts
+
+        if track_id != prev_track_id:
+            self._ynison_stale_hits = 0
+        elif not paused and progress_ms_f is not None and prev_progress_ms is not None and prev_progress_ts > 0:
+            wall_delta = now - prev_progress_ts
+            progress_delta = progress_ms_f - prev_progress_ms
+            if wall_delta >= max(15.0, self._scan_interval.total_seconds() * 1.5):
+                min_expected_progress = min(5000.0, wall_delta * 250.0)
+                if progress_delta < min_expected_progress:
+                    self._ynison_stale_hits += 1
+                    _LOGGER.debug(
+                        "Ynison watchdog: suspicious stagnant progress (track_id=%s, wall_delta=%.1fs, progress_delta=%.0fms, hits=%s)",
+                        track_id,
+                        wall_delta,
+                        progress_delta,
+                        self._ynison_stale_hits,
+                    )
+                else:
+                    self._ynison_stale_hits = 0
+            else:
+                self._ynison_stale_hits = 0
+        else:
+            self._ynison_stale_hits = 0
+
+        if not paused and duration_ms_f is not None and progress_ms_f is not None and duration_ms_f > 0:
+            remaining_sec = max(0.0, (duration_ms_f - max(0.0, progress_ms_f)) / 1000.0)
+            self._ynison_expected_end_ts = now + remaining_sec
+        else:
+            self._ynison_expected_end_ts = 0.0
+
+        self._ynison_last_track_id = track_id
+        self._ynison_last_progress_ms = progress_ms_f
+        self._ynison_last_progress_ts = now
+
+    def _get_ynison_stale_reason(self) -> Optional[str]:
+        if not self._enable_ynison or not self._ynison or self._last_push is None:
+            return None
+
+        now = time.monotonic()
+        reconnect_cooldown = max(45.0, self._scan_interval.total_seconds() * 6.0)
+        if self._ynison_last_reconnect_ts and (now - self._ynison_last_reconnect_ts) < reconnect_cooldown:
+            return None
+
+        paused = bool(self._last_push.get("paused"))
+        push_age = (now - self._last_push_ts) if self._last_push_ts else None
+
+        if (
+            not paused
+            and self._ynison_expected_end_ts > 0
+            and now > (self._ynison_expected_end_ts + max(20.0, self._scan_interval.total_seconds() * 2.0))
+        ):
+            overdue = now - self._ynison_expected_end_ts
+            return f"track-end-overdue:{overdue:.1f}s"
+
+        if (
+            not paused
+            and self._ynison_stale_hits >= 2
+            and push_age is not None
+            and push_age >= max(20.0, self._scan_interval.total_seconds() * 2.0)
+        ):
+            return f"stagnant-progress:hits={self._ynison_stale_hits}:push_age={push_age:.1f}s"
+
+        return None
+
+    def _schedule_ynison_reconnect(self, reason: str) -> None:
+        if not self._enable_ynison or not self._ynison:
+            return
+        task = self._ynison_reconnect_task
+        if task and not task.done():
+            _LOGGER.debug("Ynison watchdog: reconnect already in progress, skip (%s)", reason)
+            return
+        _LOGGER.warning("Ynison watchdog detected stale state (%s); scheduling reconnect", reason)
+        self._ynison_reconnect_task = self.hass.async_create_task(self._async_restart_ynison(reason))
+
+    async def _async_restart_ynison(self, reason: str) -> None:
+        async with self._ynison_reconnect_lock:
+            now = time.monotonic()
+            cooldown = max(45.0, self._scan_interval.total_seconds() * 6.0)
+            if self._ynison_last_reconnect_ts and (now - self._ynison_last_reconnect_ts) < cooldown:
+                _LOGGER.debug(
+                    "Ynison watchdog: reconnect suppressed by cooldown (reason=%s, since_last=%.1fs)",
+                    reason,
+                    now - self._ynison_last_reconnect_ts,
+                )
+                return
+            self._ynison_last_reconnect_ts = now
+            _LOGGER.warning("Ynison watchdog: reconnecting Ynison watcher (%s)", reason)
+            try:
+                if self._ynison:
+                    await self._ynison.stop()
+                self._ynison = YnisonWatcher(
+                    hass=self.hass,
+                    token=self._token,
+                    yaclient=self._client,
+                    on_update=self._handle_push_update,
+                )
+                self._ynison.start()
+            except Exception as e:
+                _LOGGER.warning("Ynison watchdog: reconnect failed (%s): %r", reason, e)
 
     @property
     def should_poll(self) -> bool:
@@ -753,12 +1022,32 @@ class YandexMusicNowPlayingSensor(SensorEntity):
             )
             _LOGGER.info("Listening media_player(s): %s", ", ".join(self._station_entities))
 
+        android_entities = list(dict.fromkeys(self._android_media_session_entities + self._android_notification_entities))
+        if android_entities:
+            self._unsub_android = async_track_state_change_event(
+                self.hass,
+                android_entities,
+                self._on_android_state_event,
+            )
+            _LOGGER.info(
+                "Listening Android fallback sensor(s): %s (packages=%s)",
+                ", ".join(android_entities),
+                ", ".join(self._android_packages),
+            )
+
     async def async_will_remove_from_hass(self) -> None:
+        if self._ynison_reconnect_task and not self._ynison_reconnect_task.done():
+            self._ynison_reconnect_task.cancel()
         if self._ynison:
             await self._ynison.stop()
         if self._unsub_station:
             try:
                 self._unsub_station()
+            except Exception:
+                pass
+        if self._unsub_android:
+            try:
+                self._unsub_android()
             except Exception:
                 pass
         if self._scrobbler:
@@ -768,7 +1057,52 @@ class YandexMusicNowPlayingSensor(SensorEntity):
     @callback
     def _handle_push_update(self, data: Optional[dict]) -> None:
         self._last_push_ts = time.monotonic()
+        self._update_ynison_watchdog(data)
+        if data is None:
+            _LOGGER.debug("Ynison push update: clear state requested")
+        else:
+            _LOGGER.debug("Ynison push update: %s", _dbg_track_summary(data))
         self._apply_update(data, source="ynison", push=True, clear_cache=(data is None))
+
+    def _android_is_preferred_source(self, data: Optional[dict]) -> bool:
+        if not data:
+            return False
+        pkg = str(data.get("source_package") or "").strip().lower()
+        if not pkg:
+            return False
+        return pkg in ("ru.yandex.yandexnavi", "ru.yandex.yandexmaps")
+
+    def _get_android_candidate(self) -> dict | None:
+        best = None
+        best_score = -1
+
+        for entity_id in self._android_media_session_entities:
+            data = self._extract_android_media_session_state(entity_id)
+            if not data:
+                continue
+            score = 30
+            if self._android_is_preferred_source(data):
+                score += 100
+            if not data.get("paused"):
+                score += 20
+            if data.get("track_id"):
+                score += 5
+            if score > best_score:
+                best = data
+                best_score = score
+
+        for entity_id in self._android_notification_entities:
+            data = self._extract_android_notification_state(entity_id)
+            if not data:
+                continue
+            score = 10
+            if self._android_is_preferred_source(data):
+                score += 100
+            if score > best_score:
+                best = data
+                best_score = score
+
+        return best
 
     # ----------------- PULL-фолбэк (очереди) -----------------
     async def async_update(self) -> None:
@@ -776,36 +1110,274 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         for entity_id in self._station_entities:
             st = self.hass.states.get(entity_id)
             if st is not None and st.state == "playing":
+                _LOGGER.debug("Poll decision: use media_player '%s' (state=playing)", entity_id)
                 self._on_station_state(entity_id, None, st)
                 return
 
-        # 2) Свежий push от Ynison считаем приоритетным источником.
+        # 2) Проверяем Android Companion раньше Ynison, чтобы Навигатор/Карты
+        # могли перебивать свежий, но устаревший now-playing из Яндекс.Музыки.
         push_ttl = max(30.0, self._scan_interval.total_seconds() * 3.0)
-        if self._enable_ynison and self._last_push is not None and (time.monotonic() - self._last_push_ts) <= push_ttl:
+        push_age = (time.monotonic() - self._last_push_ts) if self._last_push_ts else None
+        stale_reason = self._get_ynison_stale_reason()
+        if stale_reason:
+            _LOGGER.warning(
+                "Poll decision: Ynison stale watchdog triggered (%s); last_push=%s",
+                stale_reason,
+                _dbg_track_summary(self._last_push),
+            )
+            self._schedule_ynison_reconnect(stale_reason)
+
+        android_data = self._get_android_candidate()
+        if android_data is not None:
+            android_source = android_data.get("context_type") or "android"
+            android_preferred = self._android_is_preferred_source(android_data)
+            ynison_fresh = bool(self._enable_ynison and self._last_push is not None and push_age is not None and push_age <= push_ttl and not stale_reason)
+            if android_preferred:
+                _LOGGER.debug(
+                    "Poll decision: prefer Android source over Ynison: %s (ynison_fresh=%s, ynison=%s)",
+                    _dbg_track_summary(android_data),
+                    ynison_fresh,
+                    _dbg_track_summary(self._last_push),
+                )
+                self._apply_update(android_data, source=android_source, push=False)
+                return
+
+        # 3) Свежий push от Ynison считаем приоритетным источником, если Android не важнее.
+        if self._enable_ynison and self._last_push is not None and push_age is not None and push_age <= push_ttl and not stale_reason:
+            _LOGGER.debug("Poll decision: keep fresh Ynison push (age=%.1fs, ttl=%.1fs): %s", push_age, push_ttl, _dbg_track_summary(self._last_push))
             return
 
-        # 3) Если push нет/он устарел — используем pull как резерв.
+        # 4) Если push нет/он устарел — используем Android Companion как fallback до pull.
+        if android_data is not None:
+            _LOGGER.debug("Poll decision: use Android fallback: %s", _dbg_track_summary(android_data))
+            self._apply_update(android_data, source=(android_data.get("context_type") or "android"), push=False)
+            return
+
+        # 5) Если push нет/он устарел — используем pull как резерв.
         data = await self.hass.async_add_executor_job(self._fetch_now_playing_pull)
         if data is not None:
+            _LOGGER.debug("Poll decision: use queues fallback: %s", _dbg_track_summary(data))
             self._apply_update(data, source="queues", push=False)
             return
 
-        # 4) Если pull ничего не дал, но у нас ещё есть свежий push — не затираем его пустым состоянием.
-        if self._enable_ynison and self._last_push is not None and (time.monotonic() - self._last_push_ts) <= (push_ttl * 2.0):
+        # 6) Если pull ничего не дал, но у нас ещё есть свежий push — не затираем его пустым состоянием.
+        if self._enable_ynison and self._last_push is not None and push_age is not None and push_age <= (push_ttl * 2.0):
+            _LOGGER.debug("Poll decision: pull empty, reuse Ynison cache (age=%.1fs): %s", push_age, _dbg_track_summary(self._last_push))
             self._apply_update(self._last_push, source="ynison", push=False)
             return
 
-        # 5) Если источники временно молчат/врут, но у нас есть последнее валидное состояние,
+        # 7) Если источники временно молчат/врут, но у нас есть последнее валидное состояние,
         # сохраняем его до предполагаемого окончания трека (+ запас), а не уходим в unknown.
         if self._should_preserve_last_data() and self._last_data is not None:
             try:
                 last_data = dict(self._last_data)
             except Exception:
                 last_data = self._last_data
+            preserve_age = time.monotonic() - self._last_data_ts if self._last_data_ts else -1.0
+            preserve_ttl = self._get_preserve_timeout(self._last_data)
+            _LOGGER.debug(
+                "Poll decision: preserve last data from %s (age=%.1fs, ttl=%.1fs): %s",
+                self._last_data_source or "fallback",
+                preserve_age,
+                preserve_ttl,
+                _dbg_track_summary(last_data),
+            )
             self._apply_update(last_data, source=(self._last_data_source or "fallback"), push=False)
             return
 
+        _LOGGER.debug(
+            "Poll decision: clear sensor (push_age=%s, last_data_source=%s, last_data=%s)",
+            (f"{push_age:.1f}s" if push_age is not None else "none"),
+            self._last_data_source,
+            _dbg_track_summary(self._last_data),
+        )
         self._apply_update(None, source="queues", push=False)
+
+    @callback
+    def _on_android_state_event(self, event) -> None:
+        data = event.data
+        entity_id = data.get("entity_id")
+        new_state = data.get("new_state")
+        if not entity_id or new_state is None:
+            return
+
+        if entity_id in self._android_media_session_entities:
+            update = self._extract_android_media_session_state(entity_id, state=new_state)
+            if update is not None:
+                self._last_android_data = dict(update)
+                self._last_android_ts = time.monotonic()
+                _LOGGER.debug("Android media_session event '%s': %s", entity_id, _dbg_track_summary(update))
+                self._apply_update(update, source="android_media_session", push=True)
+            return
+
+        if entity_id in self._android_notification_entities:
+            update = self._extract_android_notification_state(entity_id, state=new_state)
+            if update is not None:
+                self._last_android_data = dict(update)
+                self._last_android_ts = time.monotonic()
+                _LOGGER.debug("Android notification event '%s': %s", entity_id, _dbg_track_summary(update))
+                self._apply_update(update, source="android_notification", push=True)
+            return
+
+    def _extract_android_media_session_state(self, entity_id: str, state: Optional[State] = None) -> dict | None:
+        st = state or self.hass.states.get(entity_id)
+        if st is None:
+            return None
+        attrs = st.attributes or {}
+
+        discovered_packages = []
+        for key in attrs.keys():
+            ck = _canon_attr_key(key)
+            for pkg in self._android_packages:
+                pkg_s = str(pkg).strip()
+                pkg_ck = _canon_attr_key(pkg_s)
+                if pkg_s and pkg_ck and pkg_ck in ck and any(token in ck for token in ("playbackstate", "title", "artist", "duration", "playbackposition", "mediaid")):
+                    if pkg_s not in discovered_packages:
+                        discovered_packages.append(pkg_s)
+
+        packages = []
+        for pkg in list(self._android_packages) + discovered_packages:
+            pkg = str(pkg).strip()
+            if pkg and pkg not in packages:
+                packages.append(pkg)
+
+        overall_state = str(st.state).strip().lower() if st.state is not None else ""
+        for pkg in packages:
+            playback_state = _flex_attr_find_for_package(attrs, "Playback state", pkg)
+            title = _flex_attr_find_for_package(attrs, "Title", pkg)
+            artist = _flex_attr_find_for_package(attrs, "Artist", pkg)
+            album = _flex_attr_find_for_package(attrs, "Album", pkg)
+            duration = _flex_attr_find_for_package(attrs, "Duration", pkg)
+            position = _flex_attr_find_for_package(attrs, "Playback position", pkg)
+            media_id = _flex_attr_find_for_package(attrs, "Media ID", pkg)
+
+            if not playback_state and (title or artist) and overall_state in ("playing", "paused"):
+                playback_state = overall_state
+
+            if not playback_state:
+                continue
+            playback_state_s = str(playback_state).strip().lower()
+            if playback_state_s not in ("playing", "paused"):
+                _LOGGER.debug(
+                    "Android media_session '%s': package=%s ignored playback_state=%s",
+                    entity_id,
+                    pkg,
+                    _dbg_trim(playback_state),
+                )
+                continue
+            if not (title or artist):
+                _LOGGER.debug(
+                    "Android media_session '%s': package=%s missing title/artist",
+                    entity_id,
+                    pkg,
+                )
+                continue
+
+            try:
+                duration_ms = int(float(duration)) if duration is not None else None
+            except Exception:
+                duration_ms = None
+            try:
+                progress_ms = int(float(position)) if position is not None else None
+            except Exception:
+                progress_ms = None
+
+            update = {
+                "title": title,
+                "artists": artist,
+                "album": None if str(album).lower() == "null" else album,
+                "track_id": self._normalize_track_id(media_id),
+                "cover": None,
+                "duration_ms": duration_ms,
+                "progress_ms": progress_ms,
+                "paused": playback_state_s == "paused",
+                "explicit": None,
+                "context_type": "android_media_session",
+                "queue_id": None,
+                "source_entity": entity_id,
+                "source_package": pkg,
+            }
+            _LOGGER.debug(
+                "Android media_session '%s': package=%s state=%s title=%s artist=%s album=%s media_id=%s duration=%s position=%s",
+                entity_id,
+                pkg,
+                playback_state_s,
+                _dbg_trim(title),
+                _dbg_trim(artist),
+                _dbg_trim(album),
+                _dbg_trim(media_id),
+                _dbg_trim(duration),
+                _dbg_trim(position),
+            )
+            return update
+
+        _LOGGER.debug(
+            "Android media_session '%s': no matching active package found; configured=%s discovered=%s state=%s keys=%s",
+            entity_id,
+            ", ".join(self._android_packages),
+            ", ".join(discovered_packages),
+            _dbg_trim(st.state),
+            ", ".join(sorted(str(k) for k in attrs.keys())[:30]),
+        )
+        return None
+
+    def _extract_android_notification_state(self, entity_id: str, state: Optional[State] = None) -> dict | None:
+        st = state or self.hass.states.get(entity_id)
+        if st is None:
+            return None
+        attrs = st.attributes or {}
+        pkg = _flex_attr_get(attrs, "Package", "package", "android.appInfo.packageName")
+        if pkg not in self._android_packages:
+            _LOGGER.debug(
+                "Android notification '%s': package mismatch pkg=%s configured=%s keys=%s",
+                entity_id,
+                _dbg_trim(pkg),
+                ", ".join(self._android_packages),
+                ", ".join(sorted(str(k) for k in attrs.keys())[:30]),
+            )
+            return None
+
+        title = _flex_attr_get(attrs, "Android.title", "android.title", "title")
+        artist = _flex_attr_get(attrs, "Android.text", "android.text", "text")
+        ongoing = _flex_attr_get(attrs, "Is ongoing", "is_ongoing", "is ongoing")
+        category = _flex_attr_get(attrs, "Category", "category")
+        channel_id = _flex_attr_get(attrs, "Channel ID", "channel_id", "channel id")
+
+        if not (title or artist):
+            _LOGGER.debug("Android notification '%s': package=%s missing title/artist", entity_id, _dbg_trim(pkg))
+            return None
+        if ongoing is False:
+            _LOGGER.debug("Android notification '%s': package=%s ongoing=false -> ignore", entity_id, _dbg_trim(pkg))
+            return None
+        if category not in (None, "transport"):
+            _LOGGER.debug("Android notification '%s': package=%s category=%s -> ignore", entity_id, _dbg_trim(pkg), _dbg_trim(category))
+            return None
+
+        _LOGGER.debug(
+            "Android notification '%s': package=%s title=%s artist=%s channel_id=%s ongoing=%s",
+            entity_id,
+            _dbg_trim(pkg),
+            _dbg_trim(title),
+            _dbg_trim(artist),
+            _dbg_trim(channel_id),
+            _dbg_trim(ongoing),
+        )
+
+        return {
+            "title": title,
+            "artists": artist,
+            "album": None,
+            "track_id": None,
+            "cover": None,
+            "duration_ms": None,
+            "progress_ms": None,
+            "paused": False,
+            "explicit": None,
+            "context_type": "android_notification",
+            "queue_id": None,
+            "source_entity": entity_id,
+            "source_package": pkg,
+        }
 
     def _get_preserve_timeout(self, data: Optional[dict]) -> float:
         """Сколько можно держать последнее корректное состояние без новых апдейтов."""
@@ -856,6 +1428,16 @@ class YandexMusicNowPlayingSensor(SensorEntity):
     # ----------------- Применение обновления -----------------
     def _apply_update(self, data: Optional[dict], source: str, *, push: bool, clear_cache: bool = False) -> None:
         self._last_push = data if source == "ynison" else self._last_push
+        if data:
+            _LOGGER.debug(
+                "Apply update: source=%s push=%s clear_cache=%s %s",
+                source,
+                push,
+                clear_cache,
+                _dbg_track_summary(data),
+            )
+        else:
+            _LOGGER.debug("Apply update: source=%s push=%s clear_cache=%s empty", source, push, clear_cache)
         if not data:
             self._attr_native_value = None
             self._attrs = {}
@@ -869,6 +1451,35 @@ class YandexMusicNowPlayingSensor(SensorEntity):
             if push or self.entity_id is not None:
                 self.async_write_ha_state()
             return
+
+        prev_attrs = self._attrs or {}
+        incoming = dict(data)
+
+        incoming_track_id = incoming.get("track_id")
+        prev_track_id = prev_attrs.get("track_id") or self._last_track_id
+
+        def _norm_same(v):
+            return str(v or "").strip().casefold()
+
+        same_track = False
+        if incoming_track_id and prev_track_id and str(incoming_track_id) == str(prev_track_id):
+            same_track = True
+        elif _norm_same(incoming.get("title")) and _norm_same(incoming.get("artists")):
+            same_track = (
+                _norm_same(incoming.get("title")) == _norm_same(prev_attrs.get("title"))
+                and _norm_same(incoming.get("artists")) == _norm_same(prev_attrs.get("artists"))
+                and (
+                    not incoming.get("source_package")
+                    or _norm_same(incoming.get("source_package")) == _norm_same(prev_attrs.get("source_package"))
+                )
+            )
+
+        if same_track:
+            for key in ("track_id", "cover", "album", "duration_ms", "explicit"):
+                if not incoming.get(key) and prev_attrs.get(key):
+                    incoming[key] = prev_attrs.get(key)
+
+        data = incoming
 
         self._last_track_id = data.get("track_id")
         title = data.get("title") or ""
@@ -887,12 +1498,18 @@ class YandexMusicNowPlayingSensor(SensorEntity):
             "explicit": data.get("explicit"),
             "context_type": data.get("context_type"),
             "queue_id": data.get("queue_id"),
+            "paused": data.get("paused"),
+            "progress_ms": data.get("progress_ms"),
             "source": source,
+            "source_entity": data.get("source_entity"),
+            "source_package": data.get("source_package"),
             "liked": liked,
+            "ynison_stale_hits": self._ynison_stale_hits,
+            "ynison_last_reconnect_age": (time.monotonic() - self._ynison_last_reconnect_ts) if self._ynison_last_reconnect_ts else None,
         }
 
         # запомним последнюю валидную информацию сенсора для возможного отката
-        if source in ("queues", "ynison", "media_player"):
+        if source in ("queues", "ynison", "media_player", "android_media_session", "android_notification"):
             try:
                 self._last_data = dict(data)
             except Exception:
@@ -903,6 +1520,14 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         # шарим текущий трек для switch
         shared = self.hass.data.setdefault(DOMAIN, {})
         shared["current_track_id"] = self._last_track_id
+
+        if self._last_track_id and not self._attrs.get("cover"):
+            self.hass.async_create_task(self._async_enrich_track_meta(self._last_track_id))
+        elif not self._last_track_id and source in ("android_media_session", "android_notification") and (title or artists):
+            key = f"{artists}@@{title}@@{source}"
+            if key != self._last_resolve_key:
+                self._last_resolve_key = key
+                self.hass.async_create_task(self._async_resolve_station_track(title, artists, self._attrs.get("album"), self._attrs.get("cover")))
 
         if push or self.entity_id is not None:
             self.async_write_ha_state()
@@ -925,12 +1550,14 @@ class YandexMusicNowPlayingSensor(SensorEntity):
                 _LOGGER.debug("queues_list(): empty")
                 return None
 
+            _LOGGER.debug("queues_list(): got %s queue(s)", len(queues))
+
             # По документации yandex-music последняя проигрываемая очередь
             # уже приходит первой в списке, поэтому не пересортировываем очереди
             # только по modified — это может привести к выбору устаревшего плейлиста.
             queues_ordered = list(queues)
 
-            for qi in queues_ordered:
+            for idx_q, qi in enumerate(queues_ordered):
                 qid = getattr(qi, "id", None) or getattr(qi, "queue_id", None)
                 q = None
                 if hasattr(qi, "fetch_queue"):
@@ -944,21 +1571,39 @@ class YandexMusicNowPlayingSensor(SensorEntity):
                     except Exception:
                         q = None
                 if not q:
+                    _LOGGER.debug("queues[%s]: skip queue_id=%s because queue fetch returned empty", idx_q, qid)
                     continue
 
                 current_index = getattr(q, "current_index", -1)
+                context = getattr(q, "context", None)
+                context_type = getattr(context, "type", None)
+                context_id = getattr(context, "id", None)
+                modified = getattr(qi, "modified", None)
                 if current_index is None or current_index < 0:
+                    _LOGGER.debug(
+                        "queues[%s]: queue_id=%s current_index=%s context_type=%s context_id=%s modified=%s -> skip",
+                        idx_q, qid, current_index, context_type, context_id, modified
+                    )
                     continue
 
                 try:
                     tid = q.get_current_track()
-                except Exception:
+                except Exception as e:
+                    _LOGGER.debug("queues[%s]: queue_id=%s get_current_track failed: %r", idx_q, qid, e)
                     tid = None
                 if not tid:
+                    _LOGGER.debug(
+                        "queues[%s]: queue_id=%s current_index=%s context_type=%s context_id=%s modified=%s -> current track empty",
+                        idx_q, qid, current_index, context_type, context_id, modified
+                    )
                     continue
 
                 track_id = (
                     getattr(tid, "id", None) or getattr(tid, "track_id", None) or tid
+                )
+                _LOGGER.debug(
+                    "queues[%s]: candidate queue_id=%s current_index=%s context_type=%s context_id=%s modified=%s raw_track=%s resolved_track_id=%s",
+                    idx_q, qid, current_index, context_type, context_id, modified, _dbg_trim(tid), track_id
                 )
                 if not track_id:
                     continue
@@ -988,6 +1633,19 @@ class YandexMusicNowPlayingSensor(SensorEntity):
                     uri = cover_uri.replace("%%", "300x300")
                     cover = uri if uri.startswith("http") else f"https://{uri}"
                 context_type = getattr(getattr(q, "context", None), "type", None)
+
+                update = {
+                    "title": getattr(track, "title", None),
+                    "artists": artists,
+                    "album": album_title,
+                    "track_id": getattr(track, "id", None),
+                    "cover": cover,
+                    "duration_ms": getattr(track, "duration_ms", None),
+                    "explicit": getattr(track, "explicit", None),
+                    "context_type": context_type,
+                    "queue_id": getattr(q, "id", None),
+                }
+                _LOGGER.debug("queues[%s]: selected %s", idx_q, _dbg_track_summary(update))
 
                 return {
                     "title": getattr(track, "title", None),
@@ -1024,7 +1682,16 @@ class YandexMusicNowPlayingSensor(SensorEntity):
 
         # если колонка не играет — не затираем сенсор, а возвращаем последнюю валидную инфу
         if state != "playing":
-            _LOGGER.debug("Station '%s' not playing (state=%s) — keep previous sensor data", entity_id, state)
+            _LOGGER.debug(
+                "Station '%s' not playing (state=%s, media_title=%s, media_artist=%s, media_content_id=%s, player_state_id=%s, player_state_playable_id=%s) — keep previous sensor data",
+                entity_id,
+                state,
+                _dbg_trim(attrs.get("media_title") or attrs.get("title")),
+                _dbg_trim(attrs.get("media_artist") or attrs.get("subtitle") or attrs.get("artist")),
+                _dbg_trim(attrs.get("media_content_id") or attrs.get("content_id")),
+                _dbg_trim((attrs.get("player_state") or {}).get("id")),
+                _dbg_trim((attrs.get("player_state") or {}).get("playable_id")),
+            )
             if self._last_data is not None:
                 self._apply_update(dict(self._last_data), source=(self._last_data_source or "queues"), push=True)
             return
@@ -1068,6 +1735,20 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         )
         track_id = self._normalize_track_id(content_id) or self._normalize_track_id(
             attrs.get("track_id") or attrs.get("yandex_music_track_id") or attrs.get("yandex_track_id")
+        )
+
+        _LOGGER.debug(
+            "Station '%s' playing snapshot: title=%s artist=%s album=%s track_id=%s media_content_id=%s progress=%s duration=%s player_state_id=%s player_state_playable_id=%s",
+            entity_id,
+            _dbg_trim(title),
+            _dbg_trim(artist),
+            _dbg_trim(album),
+            _dbg_trim(track_id),
+            _dbg_trim(content_id),
+            _dbg_trim(progress),
+            _dbg_trim(duration),
+            _dbg_trim((attrs.get("player_state") or {}).get("id")),
+            _dbg_trim((attrs.get("player_state") or {}).get("playable_id")),
         )
 
         # Обновляем видимую строку
