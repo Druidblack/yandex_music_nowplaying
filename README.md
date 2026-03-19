@@ -20,7 +20,11 @@ sensor:
     scan_interval: '00:00:10'
     ynison: true
     station_entities: "media_player.yandex_station_l015a4b0016grv, media_player.yandex_station_l81a1s70061asz"
-    
+
+    android_media_session_entities: "sensor.m2007j20cg_media_session"
+    android_notification_entities: "sensor.m2007j20cg_last_notification"
+    android_packages: "ru.yandex.yandexnavi"
+ 
     lastfm:
       enabled: true
       api_key: f7939d0ae9ff6700f5
@@ -38,3 +42,19 @@ switch:
 session_key можно получить по ссылке https://dullmace.github.io/lastfm-sessionkey/
 
 Токен для яндекса можно получить при помощи https://chromewebstore.google.com/detail/yandex-music-token/lcbjeookjibfhjjopieifgjnhlegmkib
+
+Обновил интеграцию, что бы можно было получать проигрываемую музыку из навигатора. 
+Для этого на устройстве (магнитола, планшет) должены быть установленны  приложения home assistant ну и яндекс навигатор
+В приложение home assistant нужно  включить "Сенсоры уведомлений"
+[111](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/photo_2026-03-19_13-05-57.jpg)
+Включить нужно "Последнее уведомление" и "Сеанс мультимедиа"
+[21314](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/photo_2026-03-19_13-06-24.jpg)
+[fdt](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/photo_2026-03-19_13-07-36.jpg)
+В "Сенсоре уведомлений" нужно выбрать в списке разрешенных Яндекс навигатор
+
+И в configuration.yaml прописать сенсоры из которых мы будем получать данные. В примере выше они написанны. m2007j20cg - название вашего устройства
+```yaml
+sensor:
+    android_media_session_entities: "sensor.m2007j20cg_media_session"
+    android_notification_entities: "sensor.m2007j20cg_last_notification"
+```
