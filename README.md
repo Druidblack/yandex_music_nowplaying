@@ -52,6 +52,7 @@ session_key можно получить по ссылке https://dullmace.githu
 ![21314](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/photo_2026-03-19_13-06-24.jpg)
 
 ![fdt](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/photo_2026-03-19_13-07-36.jpg)
+
 В итоге вы должны увидель такие сенсоры
 
 ![132445](https://github.com/Druidblack/yandex_music_nowplaying/blob/main/img/итер.PNG)
