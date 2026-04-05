@@ -134,6 +134,17 @@ LASTFM_SCHEMA = vol.Schema(
     }
 )
 
+MALOJA_SCHEMA = vol.Schema(
+    {
+        vol.Optional("enabled", default=True): cv.boolean,
+        vol.Required("url"): cv.string,
+        vol.Required("api_key"): cv.string,
+        vol.Optional("verify_ssl", default=True): cv.boolean,
+        vol.Optional("min_scrobble_percent", default=50): vol.All(int, vol.Range(min=1, max=100)),
+        vol.Optional("min_scrobble_seconds", default=240): vol.All(int, vol.Range(min=30, max=3600)),
+    }
+)
+
 # -------- Конфиг --------
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
@@ -153,6 +164,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional("android_packages", default=["ru.yandex.yandexnavi", "ru.yandex.yandexmaps", "ru.yandex.music"]): vol.Any(cv.string, [cv.string]),
         # Опционально: Last.fm
         vol.Optional("lastfm"): LASTFM_SCHEMA,
+        vol.Optional("maloja"): MALOJA_SCHEMA,
     }
 )
 
@@ -191,34 +203,28 @@ def _likes_cache_touch_remove(hass: HomeAssistant, track_id: Any):
     _likes_cache_set(hass, s)
 
 
-# ---------------- Last.fm Scrobbler (опционально) ----------------
-class LastFmScrobbler:
+# ---------------- Базовый scrobbler с порогом отправки ----------------
+class TimedScrobblerBase:
     """
-    Лёгкий клиент Last.fm:
-      - updateNowPlaying при смене трека
+    Общая логика для сервисов скробблинга:
+      - реакция на смену трека
+      - update now playing (если сервис поддерживает)
       - планирование scrobble по порогу min(%, сек) от старта
-    Только aiohttp-сессия HA; без блокирующих вызовов.
     """
 
-    API_URL = "https://ws.audioscrobbler.com/2.0/"
+    service_name = "Scrobbler"
+    supports_now_playing = False
 
     def __init__(
         self,
         hass: HomeAssistant,
-        api_key: str,
-        api_secret: str,
-        session_key: str,
         min_scrobble_percent: int = 50,
         min_scrobble_seconds: int = 240,
     ) -> None:
         self.hass = hass
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.session_key = session_key
         self.min_percent = max(1, min(100, int(min_scrobble_percent)))
         self.min_seconds = max(30, min(3600, int(min_scrobble_seconds)))
 
-        self._session = async_get_clientsession(hass)
         self._current_key: Optional[str] = None
         self._last_nowplaying_key: Optional[str] = None
         self._last_scrobbled_key: Optional[str] = None
@@ -253,6 +259,135 @@ class LastFmScrobbler:
         parts = re.split(r"\s*,\s*|\s*;\s*|\s*/\s*", s)
         parts = [p for p in parts if p]
         return " & ".join(parts) if len(parts) > 1 else s
+
+    def _cancel_pending_scrobble(self) -> None:
+        if self._scrobble_task and not self._scrobble_task.done():
+            self._scrobble_task.cancel()
+        self._scrobble_task = None
+
+    def shutdown(self) -> None:
+        self._cancel_pending_scrobble()
+
+    async def _on_new_track(self, artist: str, title: str, album: Optional[str], duration_sec: Optional[int]) -> None:
+        return None
+
+    async def _submit_scrobble(
+        self,
+        artist: str,
+        title: str,
+        album: Optional[str],
+        timestamp: int,
+        listened_sec: int,
+        duration_sec: Optional[int],
+    ) -> None:
+        raise NotImplementedError
+
+    def on_track_update(
+        self,
+        *,
+        artist: Optional[str],
+        title: Optional[str],
+        album: Optional[str],
+        duration_ms: Optional[int],
+        progress_sec: Optional[float] = None,
+    ) -> None:
+        """Вызывается сенсором при каждом апдейте playing."""
+        artist_s = (artist or "").strip()
+        title_s = (title or "").strip()
+        album_s = (album or "").strip() if album else None
+        duration_sec = self._as_int_seconds((duration_ms or 0) / 1000.0 if duration_ms else None)
+
+        artist_s = self._normalize_artist_string(artist_s)
+
+        if not artist_s and not title_s:
+            return
+
+        key = self._build_track_key(artist_s, title_s, album_s, duration_sec)
+        if key != self._current_key:
+            # Новый трек: отменяем прошлый таймер и при необходимости отправляем Now Playing
+            self._current_key = key
+            self._cancel_pending_scrobble()
+
+            now = time.time()
+            prog = float(progress_sec) if progress_sec is not None else 0.0
+            start_ts = now - max(0.0, prog)
+
+            if duration_sec and duration_sec > 0:
+                threshold = min(self.min_seconds, int(duration_sec * (self.min_percent / 100.0)))
+            else:
+                threshold = self.min_seconds
+            threshold = max(1, threshold)
+
+            fire_ts = int(start_ts + threshold)
+            delay = max(0.0, fire_ts - now)
+
+            if self.supports_now_playing and key != self._last_nowplaying_key:
+                self._last_nowplaying_key = key
+
+                async def _now_playing_later():
+                    try:
+                        await self._on_new_track(artist_s, title_s, album_s, duration_sec)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        _LOGGER.debug("%s now playing error: %r", self.service_name, e)
+
+                self.hass.loop.create_task(_now_playing_later())
+
+            if key != self._last_scrobbled_key:
+                async def _scrobble_later():
+                    try:
+                        await asyncio.sleep(delay)
+                        if self._current_key != key:
+                            return
+                        await self._submit_scrobble(
+                            artist=artist_s,
+                            title=title_s,
+                            album=album_s,
+                            timestamp=fire_ts,
+                            listened_sec=threshold,
+                            duration_sec=duration_sec,
+                        )
+                        self._last_scrobbled_key = key
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:
+                        _LOGGER.debug("%s scrobble error: %r", self.service_name, e)
+
+                self._scrobble_task = self.hass.loop.create_task(_scrobble_later())
+
+
+# ---------------- Last.fm Scrobbler (опционально) ----------------
+class LastFmScrobbler(TimedScrobblerBase):
+    """
+    Лёгкий клиент Last.fm:
+      - updateNowPlaying при смене трека
+      - планирование scrobble по порогу min(%, сек) от старта
+    Только aiohttp-сессия HA; без блокирующих вызовов.
+    """
+
+    service_name = "Last.fm"
+    supports_now_playing = True
+    API_URL = "https://ws.audioscrobbler.com/2.0/"
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api_key: str,
+        api_secret: str,
+        session_key: str,
+        min_scrobble_percent: int = 50,
+        min_scrobble_seconds: int = 240,
+    ) -> None:
+        super().__init__(
+            hass=hass,
+            min_scrobble_percent=min_scrobble_percent,
+            min_scrobble_seconds=min_scrobble_seconds,
+        )
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.session_key = session_key
+        self._session = async_get_clientsession(hass)
 
     def _sign(self, params: dict) -> str:
         # Сигнатура: конкат всех key+value в алф. порядке ключей + secret, md5 hex
@@ -312,75 +447,110 @@ class LastFmScrobbler:
             params["duration[0]"] = str(duration_sec)
         await self._post(params)
 
-    def _cancel_pending_scrobble(self) -> None:
-        if self._scrobble_task and not self._scrobble_task.done():
-            self._scrobble_task.cancel()
-        self._scrobble_task = None
+    async def _on_new_track(self, artist: str, title: str, album: Optional[str], duration_sec: Optional[int]) -> None:
+        await self._update_now_playing(artist, title, album, duration_sec)
 
-    def shutdown(self) -> None:
-        self._cancel_pending_scrobble()
-
-    def on_track_update(
+    async def _submit_scrobble(
         self,
-        *,
-        artist: Optional[str],
-        title: Optional[str],
+        artist: str,
+        title: str,
         album: Optional[str],
-        duration_ms: Optional[int],
-        progress_sec: Optional[float] = None,
+        timestamp: int,
+        listened_sec: int,
+        duration_sec: Optional[int],
     ) -> None:
-        """Вызывается сенсором при каждом апдейте playing."""
-        artist_s = (artist or "").strip()
-        title_s = (title or "").strip()
-        album_s = (album or "").strip() if album else None
-        duration_sec = self._as_int_seconds((duration_ms or 0) / 1000.0 if duration_ms else None)
+        await self._scrobble(artist, title, album, timestamp, duration_sec)
 
 
-        artist_s = self._normalize_artist_string(artist_s)
+# ---------------- Maloja Scrobbler (опционально) ----------------
+class MalojaScrobbler(TimedScrobblerBase):
+    """
+    Лёгкий клиент Maloja через native API (/apis/mlj_1/newscrobble).
+    Maloja принимает API key как `key`/`apikey`; now playing через native API не используется,
+    поэтому отправляем только полноценные scrobble-события.
+    """
 
-        if not artist_s and not title_s:
-            return
+    service_name = "Maloja"
+    supports_now_playing = False
 
-        key = self._build_track_key(artist_s, title_s, album_s, duration_sec)
-        if key != self._current_key:
-            # Новый трек: отменяем прошлый таймер и отправляем Now Playing
-            self._current_key = key
-            self._cancel_pending_scrobble()
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        url: str,
+        api_key: str,
+        verify_ssl: bool = True,
+        min_scrobble_percent: int = 50,
+        min_scrobble_seconds: int = 240,
+    ) -> None:
+        super().__init__(
+            hass=hass,
+            min_scrobble_percent=min_scrobble_percent,
+            min_scrobble_seconds=min_scrobble_seconds,
+        )
+        self.base_url = (url or "").rstrip("/")
+        self.api_key = api_key
+        self.verify_ssl = bool(verify_ssl)
+        self._session = async_get_clientsession(hass)
 
-            now = time.time()
-            prog = float(progress_sec) if progress_sec is not None else 0.0
-            start_ts = now - max(0.0, prog)
+    @staticmethod
+    def _artist_list_from_string(artist: str) -> list[str]:
+        if not artist:
+            return []
+        parts = [p.strip() for p in artist.split(" & ") if p and p.strip()]
+        return parts or [artist]
 
-            if duration_sec and duration_sec > 0:
-                threshold = min(self.min_seconds, int(duration_sec * (self.min_percent / 100.0)))
-            else:
-                threshold = self.min_seconds
+    async def _post_scrobble(self, payload: dict) -> dict | None:
+        url = f"{self.base_url}/apis/mlj_1/newscrobble"
+        req_kwargs = {
+            "params": {"key": self.api_key},
+            "json": payload,
+            "timeout": 20,
+        }
+        if not self.verify_ssl:
+            req_kwargs["ssl"] = False
 
-            fire_ts = int(start_ts + threshold)
-            delay = max(0.0, fire_ts - now)
+        try:
+            async with self._session.post(url, **req_kwargs) as resp:
+                txt = await resp.text()
+                if resp.status not in (200, 201):
+                    _LOGGER.debug("Maloja HTTP %s: %s", resp.status, txt[:300])
+                    return None
+                if not txt:
+                    return {"status": "ok"}
+                try:
+                    return json.loads(txt)
+                except Exception:
+                    _LOGGER.debug("Maloja JSON parse failed: %s", txt[:200])
+                    return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _LOGGER.debug("Maloja post error: %r", e)
+            return None
 
-            # Обновляем Now Playing (только если ещё не отправляли для этого ключа)
-            if key != self._last_nowplaying_key:
-                self._last_nowplaying_key = key
-                self.hass.loop.create_task(self._update_now_playing(artist_s, title_s, album_s, duration_sec))
+    async def _submit_scrobble(
+        self,
+        artist: str,
+        title: str,
+        album: Optional[str],
+        timestamp: int,
+        listened_sec: int,
+        duration_sec: Optional[int],
+    ) -> None:
+        payload = {
+            "artists": self._artist_list_from_string(artist),
+            "title": title or "",
+            "duration": int(listened_sec),
+            "time": int(timestamp),
+        }
+        if album:
+            payload["album"] = album
+        if duration_sec is not None and duration_sec > 0:
+            payload["length"] = int(duration_sec)
 
-            # Если ещё не скроббили этот ключ — планируем отправку
-            if key != self._last_scrobbled_key:
-                async def _scrobble_later():
-                    try:
-                        await asyncio.sleep(delay)
-                        if self._current_key != key:
-                            return
-                        await self._scrobble(artist_s, title_s, album_s, fire_ts, duration_sec)
-                        self._last_scrobbled_key = key
-                    except asyncio.CancelledError:
-                        return
-                    except Exception as e:
-                        _LOGGER.debug("Last.fm scrobble error: %r", e)
-
-                self._scrobble_task = self.hass.loop.create_task(_scrobble_later())
-        else:
-            pass
+        resp = await self._post_scrobble(payload)
+        if resp and resp.get("status") not in ("success", "ok", "no_operation"):
+            _LOGGER.debug("Maloja returned non-success payload: %s", _dbg_trim(resp))
 
 
 # -------- Ynison watcher (WS, Put-only — для браузера/телефона) --------
@@ -702,23 +872,42 @@ async def async_setup_platform(
     android_notification_entities = _normalize_entity_list(config.get("android_notification_entities"))
     android_packages = _normalize_entity_list(config.get("android_packages"))
 
-    # --- опциональный Last.fm ---
+    # --- опциональные scrobbler-ы ---
+    scrobblers: list[TimedScrobblerBase] = []
+
     lastfm_cfg = config.get("lastfm")
-    scrobbler: Optional[LastFmScrobbler] = None
     if lastfm_cfg and lastfm_cfg.get("enabled", True):
         try:
-            scrobbler = LastFmScrobbler(
-                hass=hass,
-                api_key=lastfm_cfg["api_key"],
-                api_secret=lastfm_cfg["api_secret"],
-                session_key=lastfm_cfg["session_key"],
-                min_scrobble_percent=lastfm_cfg.get("min_scrobble_percent", 50),
-                min_scrobble_seconds=lastfm_cfg.get("min_scrobble_seconds", 240),
+            scrobblers.append(
+                LastFmScrobbler(
+                    hass=hass,
+                    api_key=lastfm_cfg["api_key"],
+                    api_secret=lastfm_cfg["api_secret"],
+                    session_key=lastfm_cfg["session_key"],
+                    min_scrobble_percent=lastfm_cfg.get("min_scrobble_percent", 50),
+                    min_scrobble_seconds=lastfm_cfg.get("min_scrobble_seconds", 240),
+                )
             )
             _LOGGER.info("Last.fm scrobbling is enabled")
         except Exception as e:
             _LOGGER.warning("Last.fm init failed: %r", e)
-            scrobbler = None
+
+    maloja_cfg = config.get("maloja")
+    if maloja_cfg and maloja_cfg.get("enabled", True):
+        try:
+            scrobblers.append(
+                MalojaScrobbler(
+                    hass=hass,
+                    url=maloja_cfg["url"],
+                    api_key=maloja_cfg["api_key"],
+                    verify_ssl=maloja_cfg.get("verify_ssl", True),
+                    min_scrobble_percent=maloja_cfg.get("min_scrobble_percent", 50),
+                    min_scrobble_seconds=maloja_cfg.get("min_scrobble_seconds", 240),
+                )
+            )
+            _LOGGER.info("Maloja scrobbling is enabled")
+        except Exception as e:
+            _LOGGER.warning("Maloja init failed: %r", e)
 
     # --- аутентификация в Yandex Music SDK ---
     def _build_client_and_token():
@@ -770,7 +959,7 @@ async def async_setup_platform(
         android_media_session_entities=android_media_session_entities,
         android_notification_entities=android_notification_entities,
         android_packages=android_packages,
-        scrobbler=scrobbler,
+        scrobblers=scrobblers,
     )
     async_add_entities([entity], True)
 
@@ -799,7 +988,7 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         android_media_session_entities: list[str],
         android_notification_entities: list[str],
         android_packages: list[str],
-        scrobbler: Optional[LastFmScrobbler],
+        scrobblers: list[TimedScrobblerBase],
     ):
         self.hass = hass
         self._client = client
@@ -825,8 +1014,8 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         self._last_android_data: Optional[dict] = None
         self._last_android_ts: float = 0.0
 
-        # Last.fm
-        self._scrobbler = scrobbler
+        # Last.fm / Maloja / другие совместимые scrobbler-ы
+        self._scrobblers = list(scrobblers or [])
 
         # для отката, если колонка не играет
         self._last_data: Optional[dict] = None
@@ -1050,8 +1239,11 @@ class YandexMusicNowPlayingSensor(SensorEntity):
                 self._unsub_android()
             except Exception:
                 pass
-        if self._scrobbler:
-            self._scrobbler.shutdown()
+        for scrobbler in self._scrobblers:
+            try:
+                scrobbler.shutdown()
+            except Exception:
+                pass
 
     # ----------------- PUSH из Ynison -----------------
     @callback
@@ -1532,9 +1724,9 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         if push or self.entity_id is not None:
             self.async_write_ha_state()
 
-        # Last.fm now playing / планирование scrobble (если включён)
-        if self._scrobbler:
-            self._scrobbler.on_track_update(
+        # scrobbling (если включён один или несколько сервисов)
+        for scrobbler in self._scrobblers:
+            scrobbler.on_track_update(
                 artist=artists,
                 title=title,
                 album=self._attrs.get("album"),
@@ -1823,8 +2015,8 @@ class YandexMusicNowPlayingSensor(SensorEntity):
         if self.entity_id is not None:
             self.async_write_ha_state()
 
-        # Last.fm: передаём апдейт (с прогрессом и длительностью)
-        if self._scrobbler:
+        # scrobbling: передаём апдейт (с прогрессом и длительностью)
+        if self._scrobblers:
             # progress может быть в секундах (media_position) или в мс (position_ms)
             prog_sec = None
             if progress is not None:
@@ -1842,13 +2034,14 @@ class YandexMusicNowPlayingSensor(SensorEntity):
                 except Exception:
                     dur_ms = None
 
-            self._scrobbler.on_track_update(
-                artist=artist,
-                title=title,
-                album=album,
-                duration_ms=dur_ms,
-                progress_sec=prog_sec,
-            )
+            for scrobbler in self._scrobblers:
+                scrobbler.on_track_update(
+                    artist=artist,
+                    title=title,
+                    album=album,
+                    duration_ms=dur_ms,
+                    progress_sec=prog_sec,
+                )
 
     @staticmethod
     def _normalize_track_id(val: Any) -> Optional[str]:
